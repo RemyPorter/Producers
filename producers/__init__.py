@@ -10,7 +10,18 @@ in a queue. The host application can then access the queue to get results.
 from abc import abstractmethod,ABCMeta
 from multiprocessing import Process, Queue
 
-STOP_MSG = "STOP PRODUCTION"
+class StopMessage(object):
+    pass
+
+STOP_MESSAGE = StopMessage()
+
+class AlreadyStartedError(Exception):
+    """The producer was previously started, and cannot be restarted"""
+    pass
+
+class NotStartedException(Exception):
+    """The producer was never started"""
+    pass
 
 class ProductionError(Exception):
     """An error occurred in the underlying production process"""
@@ -60,6 +71,12 @@ class Producer(object):
         else:
             self.outbound = Queue(maxsize=buffer_size)
         self._did_start = False
+        self._running = False
+
+    def _shutdown(self):
+        self.inbound.close()
+        self.outbound.close()
+        self._running = False
 
     @abstractmethod
     def handle_message(self, msg):
@@ -85,10 +102,11 @@ class Producer(object):
         NB: I tried having these as `self` accesses, and not parameters,
         but it seems like the queues wouldn't get populated.
         """
-        while True:
+        while self._running:
             while not inbound.empty():
                 msg = inbound.get_nowait()
-                if msg == STOP_MSG:
+                if isinstance(msg, StopMessage):
+                    self._shutdown()
                     break
                 try:
                     self.handle_message(msg)
@@ -99,22 +117,27 @@ class Producer(object):
                     outbound.put(self.production_step())
                 except Exception as e:
                     self.outbound.put(ProductionStepError(e))
+        return None
 
     def start(self):
         """
         Start the child production process
         """
+        if self._did_start:
+            raise AlreadyStartedError()
         self.process = Process(target=self.run, args=(self.inbound, self.outbound))
-        self.process.start()
         self._did_start = True
+        self._running = True
+        self.process.start()
+
 
     def stop(self):
         """
-        Send a stop message to end the child process, wait for it to exit
+        Send a stop message to end the child process. The child process
+        will take this to shutdown gracefully.
         """
         if self._did_start:
-            self.inbound.put_nowait(STOP_MSG)
-            self.process.join()
+            self.send(STOP_MESSAGE)
 
     def send(self, msg):
         """
@@ -126,7 +149,7 @@ class Producer(object):
         """
         self.inbound.put_nowait(msg)
 
-    def get(self):
+    def get(self, timeout=0.05):
         """
         Return the next message in the outbound queue.
 
@@ -137,29 +160,8 @@ class Producer(object):
         instead.
         """
         if not self._did_start:
-            raise "Producer not started"
-        res = self.outbound.get_nowait()
+            raise NotStartedException()
+        res = self.outbound.get(timeout=timeout)
         if isinstance(res, ProductionError):
             raise res
-        return res
-
-class CountProducer(Producer):
-    """
-    Simple demo class to show how production works.
-
-    Launches a process which counts. Only buffers the next
-    ten items.
-    """
-    def __init__(self):
-        super(CountProducer, self).__init__(10)
-        self.i = 0
-
-    def handle_message(self, msg):
-        """Take the contents of the message, and make the next value that"""
-        self.i = msg
-
-    def production_step(self):
-        """Return the current value, increment for the next iteration"""
-        res = self.i
-        self.i += 1
         return res
