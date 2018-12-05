@@ -8,13 +8,7 @@ in a queue. The host application can then access the queue to get results.
 """
 
 from abc import abstractmethod,ABCMeta
-from multiprocessing import Process, Queue
-
-class StopMessage(object):
-    """Signal a producer process to quit"""
-    pass
-
-STOP_MESSAGE = StopMessage()
+from multiprocessing import Process, Queue, Event
 
 class AlreadyStartedError(Exception):
     """The producer was previously started, and cannot be restarted"""
@@ -72,12 +66,12 @@ class Producer(object):
         else:
             self.outbound = Queue(maxsize=buffer_size)
         self._did_start = False
-        self._running = False
+        self._exit = Event()
 
     def _shutdown(self):
         self.inbound.close()
         self.outbound.close()
-        self._running = False
+        self._exit.set()
 
     @abstractmethod
     def handle_message(self, msg):
@@ -103,22 +97,18 @@ class Producer(object):
         NB: I tried having these as `self` accesses, and not parameters,
         but it seems like the queues wouldn't get populated.
         """
-        while self._running:
+        while not self._exit.is_set():
             while not inbound.empty():
                 msg = inbound.get_nowait()
-                if isinstance(msg, StopMessage):
-                    self._shutdown()
-                    break
                 try:
                     self.handle_message(msg)
                 except Exception as e:
-                    self.outbound.put(MessageHandlingError(e))
+                    outbound.put(MessageHandlingError(e))
             if not outbound.full():
                 try:
                     outbound.put(self.production_step())
                 except Exception as e:
-                    self.outbound.put(ProductionStepError(e))
-        return None
+                    outbound.put(ProductionStepError(e))
 
     def start(self):
         """
@@ -128,7 +118,6 @@ class Producer(object):
             raise AlreadyStartedError()
         self.process = Process(target=self.run, args=(self.inbound, self.outbound))
         self._did_start = True
-        self._running = True
         self.process.start()
 
 
@@ -138,7 +127,9 @@ class Producer(object):
         will take this to shutdown gracefully.
         """
         if self._did_start:
-            self.send(STOP_MESSAGE)
+            self._shutdown()
+            self.process.join(0.01)
+            self.process.terminate()
 
     def send(self, msg):
         """
@@ -150,7 +141,7 @@ class Producer(object):
         """
         self.inbound.put_nowait(msg)
 
-    def get(self, timeout=0.05):
+    def get(self, timeout=0.01):
         """
         Return the next message in the outbound queue.
 
